@@ -40,51 +40,51 @@ const triageResponseSchema = {
 };
 
 /**
- * Sends a specific chunk of Zeek log entries to Gemini for analysis and appends the result to a JSON file
+ * Sends a specific chunk of Zeek log entries to Gemini 2.5 Pro with exponential retry handling
  */
-async function triageLogChunk(logChunk, chunkNumber, fileName, outputFile) {
+async function triageLogChunk(logChunk, chunkNumber, fileName, outputFile, retriesRemaining = 3, delayMs = 4000) {
   try {
     const cleanFolderName = path.basename(path.dirname(fileName));
-    console.log(`[+] Sending Chunk #${chunkNumber} from [${cleanFolderName}] to Gemini...`);
+    console.log(`[+] Sending Column-Stripped Chunk #${chunkNumber} from [${cleanFolderName}] to Gemini 2.5 Pro...`);
     
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash', // High throughput, low latency model optimized for parsing
-      contents: `Analyze the following raw IoT Zeek network log records and evaluate for anomalies or malicious vectors:\n\n${logChunk}`,
+      model: 'gemini-2.5-pro', // Switched to Pro for deep intelligence reasoning
+      contents: `Analyze the following raw IoT Zeek network log records and evaluate for anomalies or malicious vectors. Note that all ground-truth answers and labels have been explicitly stripped from this data:\n\n${logChunk}`,
       config: {
-        systemInstruction: "You are an expert automated SOC triage agent specializing in unmanaged IoT endpoints and Zeek/Bro log anomalies. Analyze the telemetry accurately based strictly on facts.",
+        systemInstruction: "You are an expert automated SOC triage agent specializing in unmanaged IoT endpoints and Zeek/Bro log anomalies. Analyze the telemetry accurately based strictly on raw network primitives, connection behaviors, and protocols.",
         responseMimeType: "application/json",
         responseSchema: triageResponseSchema,
         temperature: 0.1, 
       },
     });
 
-    // 1. Parse the structural string back into a temporary JS Object
     const triageReport = JSON.parse(response.text);
     
-    // 2. Inject structural metadata tracking so Splunk has perfect dashboard telemetry
     triageReport.timestamp = new Date().toISOString();
     triageReport.source_log = cleanFolderName;
     triageReport.chunk_id = chunkNumber;
 
-    // 3. Flatten the object to a single line with an explicit trailing newline (NDJSON)
     const splunkReadyLine = JSON.stringify(triageReport) + '\n';
-
-    // 4. Append directly to the master output file that Splunk can monitor natively
     fs.appendFileSync(outputFile, splunkReadyLine);
-    console.log(`    [✓] Chunk #${chunkNumber} triage saved successfully.`);
+    console.log(`    [✓] Chunk #${chunkNumber} blind triage saved successfully.`);
     
     return triageReport;
 
   } catch (error) {
-    console.error(`[-] Error during Gemini triage on Chunk #${chunkNumber}:`, error.message);
+    const isTransientError = error.message && (error.message.includes("503") || error.message.includes("429"));
+    
+    if (isTransientError && retriesRemaining > 0) {
+      console.warn(`[!] Gemini Pro experiencing high demand/limits on Chunk #${chunkNumber}. Retrying in ${delayMs / 1000}s... (${retriesRemaining} attempts left)`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      return await triageLogChunk(logChunk, chunkNumber, fileName, outputFile, retriesRemaining - 1, delayMs * 2);
+    } else {
+      console.error(`[-] CRITICAL: Chunk #${chunkNumber} failed permanently:`, error.message);
+    }
   }
 }
 
 /**
- * Streams and chunks a local Zeek log file line-by-line until completion
- * @param {string} filePath - Path to your conn.log.labeled file
- * @param {string} outputFile - Path to the destination .json file
- * @param {number} linesPerChunk - How many log entries to send at once
+ * Streams, strips labels, and chunks a local Zeek log file line-by-line until completion
  */
 async function processFullZeekLogFile(filePath, outputFile, linesPerChunk = 100) {
   const fileStream = fs.createReadStream(filePath);
@@ -95,20 +95,38 @@ async function processFullZeekLogFile(filePath, outputFile, linesPerChunk = 100)
   let chunkCount = 1;
   const folderName = path.basename(path.dirname(filePath));
 
-  console.log(`\n[+] Starting FULL processing for folder: ${folderName}`);
-  console.log(`[+] Input File: ${filePath}`);
-  console.log(`[+] Target Output Log: ${outputFile}\n`);
+  console.log(`\n========================================================================`);
+  console.log(`[+] INITIATING BLIND PRO TRIAGE FOR TARGET SCENARIO: ${folderName}`);
+  console.log(`========================================================================`);
 
   for await (const line of rl) {
-    // Retain original Zeek structural annotations so Gemini can track schema headers dynamically
+    // Process Zeek structural metadata headers
     if (line.startsWith('#')) {
-      headerLines += line + '\n';
+      // Dynamic Header Strip: Drop 'label' and 'detailed-label' from columns specification
+      if (line.startsWith('#fields')) {
+        const structuralHeaders = line.split('\t');
+        const strippedHeaders = structuralHeaders.slice(0, -2).join('\t');
+        headerLines += strippedHeaders + '\n';
+      } else if (line.startsWith('#types')) {
+        // Drop matching trailing validation types for structural alignment
+        const typeDefinitions = line.split('\t');
+        const strippedTypes = typeDefinitions.slice(0, -2).join('\t');
+        headerLines += strippedTypes + '\n';
+      } else {
+        headerLines += line + '\n';
+      }
       continue;
     }
 
-    currentChunkLines.push(line);
+    // Split row by Zeek's default tab delimiter
+    const standardColumns = line.split('\t');
 
-    // Once threshold is reached, bundle headers with the log data and send it off
+    // Execution Core Feature Strip: Drop final columns containing ground truth labels
+    const strippedNetworkPrimitives = standardColumns.slice(0, -2);
+    const reconstructedCleanLine = strippedNetworkPrimitives.join('\t');
+
+    currentChunkLines.push(reconstructedCleanLine);
+
     if (currentChunkLines.length >= linesPerChunk) {
       const logPayload = headerLines + currentChunkLines.join('\n');
       await triageLogChunk(logPayload, chunkCount, filePath, outputFile);
@@ -116,40 +134,47 @@ async function processFullZeekLogFile(filePath, outputFile, linesPerChunk = 100)
       currentChunkLines = [];
       chunkCount++;
       
-      // Safety note: If you run into TPM (Tokens Per Minute) limit errors on very huge logs,
-      // you can add a short cooling delay between chunks by uncommenting this line:
-      // await new Promise(resolve => setTimeout(resolve, 2000));
+      // === BUDGET SAFEGUARD RESTRICTION ===
+      // If we have completed 10 chunks (1,000 lines of parsed records), 
+      // stop this file and advance to the next folder scenario immediately.
+      if (chunkCount > 10) {
+        console.log(`[!] Budget Cap Enforced: Safely processed 1,000 rows for ${folderName}. Closing handles.`);
+        rl.close();
+        fileStream.destroy();
+        break; 
+      }
     }
   }
 
-  // Process leftover entries at the bottom of the log file
-  if (currentChunkLines.length > 0) {
+  // Handle any remainder lines if the log was under 1,000 lines total
+  if (currentChunkLines.length > 0 && chunkCount <= 10) {
     const logPayload = headerLines + currentChunkLines.join('\n');
     await triageLogChunk(logPayload, chunkCount, filePath, outputFile);
   }
 
-  console.log(`\n[✓] COMPLETED file parsing for ${folderName}. Total Chunks analyzed: ${chunkCount}`);
+  console.log(`[✓] COMPLETED Processing for ${folderName}.\n`);
 }
 
 /**
- * Scans the base directory to find all available valid log files and processes them
+ * Scans the base directory to find all available valid log files and processes them completely
  */
 async function runFullPipeline() {
   const baseDir = "G:/School/FinalProject6740/iot_23_datasets_full/opt/Malware-Project/BigDataset/IoTScenarios";
-  const outputFile = "./splunk_gemini_triage.json"; // This will gather all logs in NDJSON format
+  
+  // Updated destination output name to differentiate results
+  const outputFile = "./splunk_blind_gemini_triage.json"; 
 
   if (!fs.existsSync(baseDir)) {
-    console.error(`[-] Base directory not found! Check your drive letter or path format:\n    ${baseDir}`);
+    console.error(`[-] Base directory not found! Check drive mapping or path format:\n    ${baseDir}`);
     return;
   }
 
-  console.log(`[+] Scanning base directory for capture scenarios...`);
+  console.log(`[+] Initializing full ecosystem directory scan...`);
   const items = fs.readdirSync(baseDir);
 
   for (const item of items) {
     const fullPath = path.join(baseDir, item);
     
-    // Check if the item is a folder (like CTU-IoT-Malware-Capture-x-x)
     if (fs.statSync(fullPath).isDirectory()) {
       const possiblePaths = [
         path.join(fullPath, "conn.log.labeled"),
@@ -158,21 +183,15 @@ async function runFullPipeline() {
 
       for (const logFile of possiblePaths) {
         if (fs.existsSync(logFile)) {
-          // Process this entire file from start to finish
+          // Await completion of each individual file before advancing the folder loop
           await processFullZeekLogFile(logFile, outputFile, 100);
-          
-          // SAFETY BARRIER: 
-          // Keeping this 'return' processes exactly ONE complete capture scenario folder at a time 
-          // so you can manage your file output sizes and look at the logs.
-          // If you want it to run through all 23 scenarios completely unattended, simply comment out the 'return;' below!
-          console.log(`\n[!] Pipeline paused after completing the first full folder scenario.`);
-          console.log(`[!] Review your './splunk_gemini_triage.json' file. Remove 'return;' to run through remaining scenarios.`);
-          //return; 
         }
       }
     }
   }
+  
+  console.log(`\n[✓] BLIND PIPELINE COMPLETE. Your un-labeled baseline evaluation file is ready at: ${outputFile}`);
 }
 
-// Start the processing engine
+// Fire up the pipeline
 runFullPipeline();
