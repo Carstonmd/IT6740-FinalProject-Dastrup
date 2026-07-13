@@ -1,0 +1,216 @@
+// Add this line at the absolute top if your system runs Node 16 or lower to patch the web streams API
+// globalThis.ReadableStream = require('node:stream/web').ReadableStream;
+
+const { GoogleGenAI, Type } = require('@google/genai');
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+require('dotenv').config(); 
+
+// Initialize the Gemini client securely from your environment variables
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// Strict JSON structure schema to enforce factual reporting and eliminate hallucinations
+const triageResponseSchema = {
+  type: Type.OBJECT,
+  properties: {
+    severity: { 
+      type: Type.STRING, 
+      enum: ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+      description: "The assessed threat level of the log activity."
+    },
+    mitreAttackMapping: {
+      type: Type.STRING,
+      description: "Relevant MITRE ATT&CK technique ID (e.g., T1571) or 'None'."
+    },
+    confidenceScore: {
+      type: Type.INTEGER,
+      description: "Confidence rating from 0 to 100 regarding anomaly accuracy."
+    },
+    summaryAnalysis: { 
+      type: Type.STRING, 
+      description: "A concise, technical breakdown of what the device is doing."
+    },
+    isAnomalous: { 
+      type: Type.BOOLEAN,
+      description: "True if the log indicates behavioral deviation from normal IoT operations."
+    },
+    source_log: {
+      type: Type.STRING,
+      description: "Placeholder for the target dataset scenario folder name. Leave empty string."
+    }
+  },
+  required: ["severity", "mitreAttackMapping", "confidenceScore", "summaryAnalysis", "isAnomalous", "source_log"],
+};
+
+/**
+ * Helper function to dynamically locate the correct root scenario folder name
+ */
+function getScenarioFolderName(fileName) {
+  const parentDir = path.dirname(fileName);
+  const parentName = path.basename(parentDir);
+  
+  // Bug Fix: If the immediate folder is 'bro', step up one level to pull the real scenario root name
+  if (parentName.toLowerCase() === 'bro') {
+    return path.basename(path.dirname(parentDir));
+  }
+  return parentName;
+}
+
+/**
+ * Sends a specific chunk of Zeek log entries to Gemini 2.5 Pro with exponential retry handling
+ */
+async function triageLogChunk(logChunk, chunkNumber, fileName, outputFile, retriesRemaining = 3, delayMs = 4000) {
+  try {
+    const cleanFolderName = getScenarioFolderName(fileName);
+    console.log(`[+] Sending Column-Stripped Chunk #${chunkNumber} from [${cleanFolderName}] to Gemini 2.5 Pro...`);
+    
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-pro', // Switched to Pro for deep intelligence reasoning
+      contents: `Analyze the following raw IoT Zeek network log records and evaluate for anomalies or malicious vectors. Note that all ground-truth answers and labels have been explicitly stripped from this data:\n\n${logChunk}`,
+      config: {
+        systemInstruction: "You are an expert automated SOC triage agent specializing in unmanaged IoT endpoints and Zeek/Bro log anomalies. Analyze the telemetry accurately based strictly on raw network primitives, connection behaviors, and protocols. Set the source_log field to an empty string.",
+        responseMimeType: "application/json",
+        responseSchema: triageResponseSchema,
+        temperature: 0.1, 
+      },
+    });
+
+    const triageReport = JSON.parse(response.text);
+    
+    // Programmatically map the folder metadata downstream before writing to the Splunk payload
+    triageReport.timestamp = new Date().toISOString();
+    triageReport.source_log = cleanFolderName;
+    triageReport.chunk_id = chunkNumber;
+
+    const splunkReadyLine = JSON.stringify(triageReport) + '\n';
+    fs.appendFileSync(outputFile, splunkReadyLine);
+    console.log(`    [✓] Chunk #${chunkNumber} blind triage saved successfully with source_log metadata.`);
+    
+    return triageReport;
+
+  } catch (error) {
+    const isTransientError = error.message && (error.message.includes("503") || error.message.includes("429"));
+    
+    if (isTransientError && retriesRemaining > 0) {
+      console.warn(`[!] Gemini Pro experiencing high demand/limits on Chunk #${chunkNumber}. Retrying in ${delayMs / 1000}s... (${retriesRemaining} attempts left)`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      return await triageLogChunk(logChunk, chunkNumber, fileName, outputFile, retriesRemaining - 1, delayMs * 2);
+    } else {
+      console.error(`[-] CRITICAL: Chunk #${chunkNumber} failed permanently:`, error.message);
+    }
+  }
+}
+
+/**
+ * Streams, strips labels, and chunks a local Zeek log file line-by-line until completion
+ */
+async function processFullZeekLogFile(filePath, outputFile, linesPerChunk = 100) {
+  const fileStream = fs.createReadStream(filePath);
+  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+
+  let headerLines = "";
+  let currentChunkLines = [];
+  let chunkCount = 1;
+  const folderName = getScenarioFolderName(filePath);
+
+  console.log(`\n========================================================================`);
+  console.log(`[+] INITIATING BLIND PRO TRIAGE FOR TARGET SCENARIO: ${folderName}`);
+  console.log(`========================================================================`);
+
+  for await (const line of rl) {
+    // Process Zeek structural metadata headers
+    if (line.startsWith('#')) {
+      // Dynamic Header Strip: Drop 'label' and 'detailed-label' from columns specification
+      if (line.startsWith('#fields')) {
+        const structuralHeaders = line.split('\t');
+        const strippedHeaders = structuralHeaders.slice(0, -2).join('\t');
+        headerLines += strippedHeaders + '\n';
+      } else if (line.startsWith('#types')) {
+        // Drop matching trailing validation types for structural alignment
+        const typeDefinitions = line.split('\t');
+        const strippedTypes = typeDefinitions.slice(0, -2).join('\t');
+        headerLines += strippedTypes + '\n';
+      } else {
+        headerLines += line + '\n';
+      }
+      continue;
+    }
+
+    // Split row by Zeek's default tab delimiter
+    const standardColumns = line.split('\t');
+
+    // Execution Core Feature Strip: Drop final columns containing ground truth labels
+    const strippedNetworkPrimitives = standardColumns.slice(0, -2);
+    const reconstructedCleanLine = strippedNetworkPrimitives.join('\t');
+
+    currentChunkLines.push(reconstructedCleanLine);
+
+    if (currentChunkLines.length >= linesPerChunk) {
+      const logPayload = headerLines + currentChunkLines.join('\n');
+      await triageLogChunk(logPayload, chunkCount, filePath, outputFile);
+      
+      currentChunkLines = [];
+      chunkCount++;
+      
+      // === BUDGET SAFEGUARD RESTRICTION ===
+      // If we have completed 10 chunks (1,000 lines of parsed records), 
+      // stop this file and advance to the next folder scenario immediately.
+      if (chunkCount > 10) {
+        console.log(`[!] Budget Cap Enforced: Safely processed 1,000 rows for ${folderName}. Closing handles.`);
+        rl.close();
+        fileStream.destroy();
+        break; 
+      }
+    }
+  }
+
+  // Handle any remainder lines if the log was under 1,000 lines total
+  if (currentChunkLines.length > 0 && chunkCount <= 10) {
+    const logPayload = headerLines + currentChunkLines.join('\n');
+    await triageLogChunk(logPayload, chunkCount, filePath, outputFile);
+  }
+
+  console.log(`[✓] COMPLETED Processing for ${folderName}.\n`);
+}
+
+/**
+ * Scans the base directory to find all available valid log files and processes them completely
+ */
+async function runFullPipeline() {
+  const baseDir = "G:/School/FinalProject6740/iot_23_datasets_full/opt/Malware-Project/BigDataset/IoTScenarios";
+  
+  // Updated destination output name to differentiate results
+  const outputFile = "./splunk_blind_gemini_triage.json"; 
+
+  if (!fs.existsSync(baseDir)) {
+    console.error(`[-] Base directory not found! Check drive mapping or path format:\n    ${baseDir}`);
+    return;
+  }
+
+  console.log(`[+] Initializing full ecosystem directory scan...`);
+  const items = fs.readdirSync(baseDir);
+
+  for (const item of items) {
+    const fullPath = path.join(baseDir, item);
+    
+    if (fs.statSync(fullPath).isDirectory()) {
+      const possiblePaths = [
+        path.join(fullPath, "conn.log.labeled"),
+        path.join(fullPath, "bro", "conn.log.labeled")
+      ];
+
+      for (const logFile of possiblePaths) {
+        if (fs.existsSync(logFile)) {
+          // Await completion of each individual file before advancing the folder loop
+          await processFullZeekLogFile(logFile, outputFile, 100);
+        }
+      }
+    }
+  }
+  
+  console.log(`\n[✓] BLIND PIPELINE COMPLETE. Your un-labeled baseline evaluation file is ready at: ${outputFile}`);
+}
+
+// Fire up the pipeline
+runFullPipeline();
